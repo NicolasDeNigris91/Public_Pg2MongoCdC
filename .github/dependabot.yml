@@ -1,0 +1,101 @@
+version: 2
+updates:
+  # GitHub Actions used by ci.yml and codeql.yml.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: scope
+    labels: ["dependencies", "ci"]
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Go modules - one entry per service so updates do not bundle unrelated
+  # services in a single PR.
+  - package-ecosystem: gomod
+    directory: /services/sink
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(sink)"
+      include: scope
+    labels: ["dependencies", "go", "sink"]
+    groups:
+      go-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: gomod
+    directory: /services/transformer
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(transformer)"
+      include: scope
+    labels: ["dependencies", "go", "transformer"]
+    groups:
+      go-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: gomod
+    directory: /services/loadgen
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps(loadgen)"
+      include: scope
+    labels: ["dependencies", "go", "loadgen"]
+    groups:
+      go-minor-and-patch:
+        update-types: ["minor", "patch"]
+
+  # Base images for the Connect / loadgen Dockerfiles.
+  - package-ecosystem: docker
+    directory: /connectors/connect-image
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "deps(docker)"
+      include: scope
+    labels: ["dependencies", "docker"]
+
+  - package-ecosystem: docker
+    directory: /services/sink
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "deps(docker)"
+      include: scope
+    labels: ["dependencies", "docker", "sink"]
+
+  - package-ecosystem: docker
+    directory: /services/transformer
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "deps(docker)"
+      include: scope
+    labels: ["dependencies", "docker", "transformer"]
+
+  - package-ecosystem: docker
+    directory: /services/loadgen
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: "deps(docker)"
+      include: scope
+    labels: ["dependencies", "docker", "loadgen"]
