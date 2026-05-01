@@ -1,0 +1,93 @@
+name: Bug report
+description: Report incorrect or unexpected behavior in pg2mongo-cdc.
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Please fill in as much of the
+        template as you can - the more reproducible the report, the faster the fix.
+
+        Security issues should NOT be filed here. See [SECURITY.md](../SECURITY.md).
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `git rev-parse --short HEAD` or the released tag.
+      placeholder: "v1.0.0 / 30a23ea"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - sink-svc
+        - transformer-svc
+        - loadgen
+        - debezium / connect
+        - chaos scripts
+        - helm chart
+        - docker compose
+        - docs
+        - other
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: A clear description of the unexpected behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: |
+        Minimal, self-contained steps. Prefer commands over prose. Include
+        the compose overlay used (e.g. `docker-compose.yml + chaos`).
+      placeholder: |
+        1. cp .env.example .env
+        2. docker compose up -d --build --wait
+        3. bash scripts/register-connectors.sh
+        4. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs / metrics
+      description: |
+        Paste sink/transformer logs, `make verify`, or relevant Prometheus
+        counters. Use code fences. Redact any secrets.
+      render: shell
+
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: "Linux 6.6, Docker 27.x, kafka:3.7, mongo:7"
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am not reporting a security vulnerability (those go to SECURITY.md).
+          required: true

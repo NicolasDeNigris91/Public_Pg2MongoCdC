@@ -1,0 +1,50 @@
+name: Feature request
+description: Propose a change or addition to pg2mongo-cdc.
+title: "[feat] "
+labels: ["enhancement", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this template to propose a new feature or a change in existing
+        behavior. For bugs, use the bug report template instead.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What pain or limitation are you running into?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: |
+        How would you like it to work? Concrete API / config / CLI shape is
+        more useful than abstract goals.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds you tried, or other designs you rejected.
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility / migration impact
+      description: |
+        Does this change wire format, topic names, Mongo collection shape, or
+        Helm values? Anyone upgrading should know.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
