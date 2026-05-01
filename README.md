@@ -5,8 +5,12 @@ without stopping writes on the source. Postgres logical replication feeds
 Debezium into Kafka; two Go services (`transformer-svc`, `sink-svc`) consume
 Kafka, apply YAML-driven mapping rules, and write LSN-gated upserts into Mongo.
 
-[![CI](https://github.com/NicolasDeNigris91/Pg2MongoCdC/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NicolasDeNigris91/Pg2MongoCdC/actions/workflows/ci.yml)
+[![CI](https://github.com/NicolasDeNigris91/Public_Pg2MongoCdC/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NicolasDeNigris91/Public_Pg2MongoCdC/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/NicolasDeNigris91/Public_Pg2MongoCdC/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/NicolasDeNigris91/Public_Pg2MongoCdC/actions/workflows/codeql.yml)
+[![Go Report Card](https://goreportcard.com/badge/github.com/NicolasDeNigris91/Public_Pg2MongoCdC)](https://goreportcard.com/report/github.com/NicolasDeNigris91/Public_Pg2MongoCdC)
+[![Go version](https://img.shields.io/badge/go-1.26-00ADD8?logo=go)](./services/sink/go.mod)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](./CONTRIBUTING.md)
 
 ```
 PG -> WAL -> Debezium -> Kafka -> transformer (Go) -> Kafka -> sink (Go) -> MongoDB
