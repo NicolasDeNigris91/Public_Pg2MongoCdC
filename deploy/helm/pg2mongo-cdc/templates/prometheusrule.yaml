@@ -1,0 +1,106 @@
+{{- if .Values.prometheusRule.enabled -}}
+{{/*
+PrometheusRule mirroring observability/prometheus/alerts.yml from the source
+repo. Kept in sync by docs/runbook.md (one section per alert) and enforced
+by scripts/check-alert-metrics.sh in CI.
+
+We do NOT YAML-import the alerts file at chart-build time so users without
+prometheus-operator (`prometheusRule.enabled=false`) can still install
+the chart cleanly. The trade-off is that the two copies must be reviewed
+together when an alert changes.
+*/}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "pg2mongo-cdc.fullname" . }}
+  labels:
+    {{- include "pg2mongo-cdc.labels" . | nindent 4 }}
+    {{- with .Values.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: zdt-migration
+      interval: {{ .Values.prometheusRule.interval | default "30s" }}
+      rules:
+
+        - alert: ReplicationLagHigh
+          expr: histogram_quantile(0.99, sum(rate(migration_replication_lag_seconds_bucket[5m])) by (le)) > {{ .Values.prometheusRule.thresholds.replicationLagP99Seconds | default 10 }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Replication lag p99 > {{ .Values.prometheusRule.thresholds.replicationLagP99Seconds | default 10 }}s for 5m"
+            description: "Consumers are falling behind. Check consumer CPU, Mongo write latency, Kafka broker health."
+            runbook: "docs/runbook.md#replicationlaghigh"
+
+        # Sink-emitted gauge is the source of truth in any deployment.
+        # The kafka-exporter fallback is left in for parity with the dev
+        # compose stack only.
+        - alert: ConsumerLagHigh
+          expr: (migration_consumer_group_lag or sum(kafka_consumergroup_lag) by (consumergroup)) > {{ .Values.prometheusRule.thresholds.consumerLagRecords | default 10000 }}
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Consumer group lag > {{ .Values.prometheusRule.thresholds.consumerLagRecords | default 10000 }} for 2m"
+            runbook: "docs/runbook.md#consumerlaghigh"
+
+        - alert: ConsumerLagProbeStale
+          expr: migration_consumer_group_lag_age_seconds > 300
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sink-side lag probe stale for >5m"
+            description: "Sink cannot describe its own consumer group via Kafka admin. Investigate broker auth/connectivity from the sink pod."
+            runbook: "docs/runbook.md#consumerlagprobestale"
+
+        - alert: DLQNonEmpty
+          expr: sum(kafka_topic_partition_current_offset{topic=~"dlq\\..*"} - kafka_topic_partition_oldest_offset{topic=~"dlq\\..*"}) > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Dead-letter queue has unprocessed messages"
+            description: "At least one poison event is sitting in a DLQ. Human triage required."
+            runbook: "docs/runbook.md#dlqnonempty"
+
+        - alert: CheckpointStaleness
+          expr: migration_checkpoint_staleness_seconds > 60
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sink checkpoint has not advanced in >60s"
+            runbook: "docs/runbook.md#checkpointstaleness"
+
+        - alert: WriteErrorRateHigh
+          expr: sum(rate(migration_write_errors_total[5m])) / sum(rate(migration_events_processed_total{stage="sink"}[5m])) > {{ .Values.prometheusRule.thresholds.writeErrorRate | default 0.001 }}
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Sink write error rate > {{ mulf (.Values.prometheusRule.thresholds.writeErrorRate | default 0.001) 100 }}% for 5m"
+            runbook: "docs/runbook.md#writeerrorratehigh"
+
+        - alert: SinkApplyStuck
+          expr: max(migration_consecutive_apply_failures) > {{ .Values.prometheusRule.thresholds.consecutiveApplyFailures | default 5 }}
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Sink has failed >{{ .Values.prometheusRule.thresholds.consecutiveApplyFailures | default 5 }} consecutive ApplyBatch calls"
+            description: "Sink is in exponential backoff; downstream is unreachable or rejecting writes."
+            runbook: "docs/runbook.md#sinkapplystuck"
+
+        - alert: ReplicationSlotInactive
+          expr: pg_replication_slots_active == 0
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Postgres replication slot is inactive"
+            description: "Debezium is not connected to the slot. WAL will accumulate. If this persists, the source DB runs out of disk."
+            runbook: "docs/runbook.md#replicationslotinactive"
+{{- end -}}

@@ -130,6 +130,40 @@ jobs:
         working-directory: services/loadgen
         run: gosec -fmt=text ./...
 
+  # Software Bill of Materials. syft generates an SPDX/CycloneDX SBOM per
+  # Go module so consumers (and downstream supply-chain scanners) can see
+  # exactly what's compiled into the binaries we ship. Uploaded as build
+  # artifacts; in a release workflow you'd attach them to the GitHub
+  # release and/or attest with cosign.
+  sbom:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+
+      - name: SBOM - sink
+        run: syft scan dir:services/sink -o spdx-json=sbom-sink.spdx.json -o cyclonedx-json=sbom-sink.cdx.json
+
+      - name: SBOM - transformer
+        run: syft scan dir:services/transformer -o spdx-json=sbom-transformer.spdx.json -o cyclonedx-json=sbom-transformer.cdx.json
+
+      - name: SBOM - loadgen
+        run: syft scan dir:services/loadgen -o spdx-json=sbom-loadgen.spdx.json -o cyclonedx-json=sbom-loadgen.cdx.json
+
+      - name: upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: |
+            sbom-*.spdx.json
+            sbom-*.cdx.json
+          retention-days: 90
+
   # Fast feedback: go test + vet + build for both services, plus shell-syntax
   # check and compose-config validation. Should finish in ~60s.
   unit:
@@ -210,6 +244,9 @@ jobs:
             fi
           done
           echo "all scenarios carry a PASS: criterion"
+
+      - name: "alert <-> metric drift detector"
+        run: bash scripts/check-alert-metrics.sh
 
   # Hit a real Mongo (GitHub service container) for the LSN-gating proof.
   # Fast: ~15s once Go deps cache warm.
