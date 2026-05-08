@@ -22,16 +22,22 @@ type Record struct {
 	Raw        any
 }
 
+// KafkaConsumer is the subset of the broker client the loop drives:
+// poll a batch, mark records for commit, then commit marked offsets.
 type KafkaConsumer interface {
 	Poll(ctx context.Context) ([]Record, error)
 	MarkCommit(r Record)
 	CommitMarked(ctx context.Context) error
 }
 
+// Writer applies a decoded CDC batch to the downstream sink. The
+// implementation is responsible for idempotency by LSN.
 type Writer interface {
 	ApplyBatch(ctx context.Context, evs []writer.CDCEvent) error
 }
 
+// Loop holds the consume/apply/commit dependencies for one sink
+// instance. RunOnce drains one batch per call.
 type Loop struct {
 	Cons         KafkaConsumer
 	W            Writer
