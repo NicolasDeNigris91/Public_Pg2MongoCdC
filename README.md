@@ -25,7 +25,7 @@ bash scripts/register-connectors.sh
 bash scripts/seed.sh
 ```
 
-Grafana on :3000, Prometheus on :9090, Toxiproxy on :8474.
+Grafana on :3000, Prometheus on :9090, Jaeger on :16686, Toxiproxy on :8474.
 
 A chaos scenario (kill a service mid-stream and assert PG/Mongo converge):
 
@@ -79,8 +79,9 @@ make test-stack      # transformer + sink end-to-end on docker compose
   but unused. Switching is a Connect-config change.
 - Secrets are loaded from `.env` for local dev. Production deployments should
   use Vault / AWS Secrets Manager / External Secrets; see [SECURITY.md](./SECURITY.md).
-- No DLQ web UI. `make reprocess-dlq` reads `dlq.source` / `dlq.sink` and
-  re-publishes after a fix.
+- No DLQ web UI. Triage and replay is `make reprocess-dlq` (dry-run by
+  default; `make reprocess-dlq ARGS="--replay"` actually re-publishes each
+  record back to its original topic from the `__dlq_source_topic` header).
 
 ## Production deployment
 
@@ -106,6 +107,9 @@ See [`docs/deployment.md`](./docs/deployment.md) for the full procedure.
 - [`docs/chaos-findings.md`](./docs/chaos-findings.md) - chaos runs
 - [`docs/invariants.md`](./docs/invariants.md) - dev/prod compose differences
 - [`docs/decisions/`](./docs/decisions/) - architecture decision records
+  - [ADR-002](./docs/decisions/002-lsn-gated-upserts.md) - LSN-gated idempotent upserts
+  - [ADR-003](./docs/decisions/003-commit-after-sideeffect.md) - Commit-after-side-effect
+  - [ADR-004](./docs/decisions/004-schema-evolution.md) - Schema evolution via dual-write windows
 
 ## License
 

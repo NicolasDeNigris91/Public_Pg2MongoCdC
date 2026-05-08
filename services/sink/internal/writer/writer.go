@@ -17,13 +17,17 @@ const (
 )
 
 // CDCEvent is the minimal cross-source projection of a Debezium event.
+// SourceTsMs is the Postgres commit time (`source.ts_ms`) in unix-millis;
+// 0 means unknown and downstream consumers MUST treat it as a sentinel
+// (e.g. skip emitting replication-lag samples) rather than as t=epoch.
 type CDCEvent struct {
-	Table  string
-	PK     string
-	LSN    int64
-	Op     CDCOp
-	After  map[string]any
-	Before map[string]any
+	Table      string
+	PK         string
+	LSN        int64
+	SourceTsMs int64
+	Op         CDCOp
+	After      map[string]any
+	Before     map[string]any
 }
 
 // WriteOpKind enumerates the Mongo operations BuildWriteOp can emit.
@@ -47,7 +51,7 @@ type WriteOp struct {
 // BuildWriteOp builds the Mongo op for one CDC event. The LSN gate on the
 // filter is what makes at-least-once delivery safe: a redelivered or stale
 // event carries an LSN <= the stored one and is rejected as a no-op.
-func BuildWriteOp(ev CDCEvent, schemaVersion int) (WriteOp, error) {
+func BuildWriteOp(ev CDCEvent, schemaVersion int) (WriteOp, error) { //nolint:gocritic // CDCEvent passed by value is the contract: events are immutable, no aliasing
 	id := ev.Table + ":" + ev.PK
 
 	if ev.Op != OpDelete && ev.After == nil {

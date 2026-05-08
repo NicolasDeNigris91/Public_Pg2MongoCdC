@@ -7,6 +7,7 @@ import (
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -27,13 +28,29 @@ type Metrics struct {
 	// idempotent_skip_total{table} - LSN-gate rejections (E11000 swallows,
 	// tombstones skipped). Expected non-zero under replay; anomaly otherwise.
 	IdempotentSkip *prometheus.CounterVec
+
+	// consecutive_apply_failures - resets to 0 on every successful batch,
+	// climbs on every error. Feeds the backoff schedule and a future
+	// alert: "sink is up but cannot apply for >Nm".
+	ConsecutiveFailures prometheus.Gauge
 }
 
 // New creates a Metrics with all collectors registered in a fresh registry.
 // Tests use a dedicated registry per test so label cardinality cannot leak
 // across tests.
+//
+// In addition to the migration-specific counters/histograms, the registry
+// is seeded with the standard process and Go-runtime collectors. They
+// matter operationally: when migration_replication_lag_seconds spikes,
+// the first question is "is the sink CPU-bound or GC-bound or
+// blocked-on-I/O?" - go_gc_duration_seconds, go_goroutines and
+// process_resident_memory_bytes answer that without a separate exporter.
 func New() *Metrics {
 	reg := prometheus.NewRegistry()
+	reg.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+	)
 	m := &Metrics{
 		Reg: reg,
 		EventsProcessed: prometheus.NewCounterVec(
@@ -65,8 +82,14 @@ func New() *Metrics {
 			},
 			[]string{"table"},
 		),
+		ConsecutiveFailures: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "migration_consecutive_apply_failures",
+				Help: "Number of consecutive ApplyBatch failures since the last success. 0 = healthy. Climbs while Mongo is unreachable.",
+			},
+		),
 	}
-	reg.MustRegister(m.EventsProcessed, m.WriteErrors, m.ReplicationLag, m.IdempotentSkip)
+	reg.MustRegister(m.EventsProcessed, m.WriteErrors, m.ReplicationLag, m.IdempotentSkip, m.ConsecutiveFailures)
 	return m
 }
 

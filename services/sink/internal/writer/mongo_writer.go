@@ -5,8 +5,13 @@ import (
 	"errors"
 	"fmt"
 
+	"zdt/sink/internal/tracing"
+
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // MongoWriter dispatches CDC events to Mongo via BulkWrite, one BulkWrite
@@ -15,16 +20,21 @@ type MongoWriter struct {
 	client        *mongo.Client
 	db            string
 	schemaVersion int
+	onSkip        func(table string, n int)
 }
 
-// NewMongoWriter binds a Mongo client to a database name and the
-// pipeline's schema version (used by BuildWriteOp to gate replays).
-func NewMongoWriter(client *mongo.Client, db string, schemaVersion int) *MongoWriter {
-	return &MongoWriter{client: client, db: db, schemaVersion: schemaVersion}
+// NewMongoWriter constructs a writer. onSkip, if non-nil, is invoked with the
+// per-table count of events that the LSN gate rejected (either because the
+// stored sourceLsn was already >= the incoming LSN, or because an upsert
+// collided on _id - the E11000-only bulk failure path). It is the hook used
+// to feed the migration_idempotent_skip_total counter; production code wires
+// it, tests pass nil.
+func NewMongoWriter(client *mongo.Client, db string, schemaVersion int, onSkip func(table string, n int)) *MongoWriter {
+	return &MongoWriter{client: client, db: db, schemaVersion: schemaVersion, onSkip: onSkip}
 }
 
 // Apply is a single-event convenience wrapper around ApplyBatch.
-func (m *MongoWriter) Apply(ctx context.Context, ev CDCEvent) error {
+func (m *MongoWriter) Apply(ctx context.Context, ev CDCEvent) error { //nolint:gocritic // CDCEvent passed by value is the contract: events are immutable, no aliasing
 	return m.ApplyBatch(ctx, []CDCEvent{ev})
 }
 
@@ -47,17 +57,61 @@ func (m *MongoWriter) ApplyBatch(ctx context.Context, evs []CDCEvent) error {
 	}
 
 	for table, models := range byColl {
-		coll := m.client.Database(m.db).Collection(table)
-		// ordered=false so one E11000 doesn't abort the remaining inserts.
-		opts := options.BulkWrite().SetOrdered(false)
-		if _, err := coll.BulkWrite(ctx, models, opts); err != nil {
-			if allDuplicateKey(err) {
-				continue // entire "failure" is expected idempotent-skip
-			}
-			return fmt.Errorf("MongoWriter.ApplyBatch: bulkwrite %s n=%d: %w", table, len(models), err)
+		if err := m.bulkWriteTable(ctx, table, models); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// bulkWriteTable issues one BulkWrite per table and emits one
+// "sink.mongo_bulk_write" span. Span attributes record the table,
+// model count, and per-result counts so a slow span shows immediately
+// whether work was useful (matched/upserted) or all idempotent skips.
+func (m *MongoWriter) bulkWriteTable(ctx context.Context, table string, models []mongo.WriteModel) error {
+	ctx, span := tracing.Tracer().Start(ctx, "sink.mongo_bulk_write",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("db.system", "mongodb"),
+			attribute.String("db.mongodb.collection", table),
+			attribute.Int("db.mongodb.bulk_write.models", len(models)),
+		),
+	)
+	defer span.End()
+
+	coll := m.client.Database(m.db).Collection(table)
+	// ordered=false so one E11000 doesn't abort the remaining inserts.
+	opts := options.BulkWrite().SetOrdered(false)
+	res, err := coll.BulkWrite(ctx, models, opts)
+	if err != nil {
+		if allDuplicateKey(err) {
+			span.SetAttributes(attribute.Int("db.mongodb.bulk_write.idempotent_skips", len(models)))
+			m.recordSkip(table, len(models))
+			return nil // entire "failure" is expected idempotent-skip
+		}
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "bulk write failed")
+		return fmt.Errorf("MongoWriter.ApplyBatch: bulkwrite %s n=%d: %w", table, len(models), err)
+	}
+	if res != nil {
+		span.SetAttributes(
+			attribute.Int64("db.mongodb.bulk_write.matched", res.MatchedCount),
+			attribute.Int64("db.mongodb.bulk_write.upserted", res.UpsertedCount),
+			attribute.Int64("db.mongodb.bulk_write.deleted", res.DeletedCount),
+		)
+		acked := res.MatchedCount + res.UpsertedCount + res.DeletedCount
+		if skipped := int64(len(models)) - acked; skipped > 0 {
+			span.SetAttributes(attribute.Int64("db.mongodb.bulk_write.idempotent_skips", skipped))
+			m.recordSkip(table, int(skipped))
+		}
+	}
+	return nil
+}
+
+func (m *MongoWriter) recordSkip(table string, n int) {
+	if m.onSkip != nil && n > 0 {
+		m.onSkip(table, n)
+	}
 }
 
 // allDuplicateKey reports whether every per-record error in a bulk failure

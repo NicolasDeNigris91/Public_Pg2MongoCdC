@@ -49,7 +49,10 @@ func TestMongoWriter_LSNGateOrdering(t *testing.T) {
 	testDB := "migration_test_" + time.Now().Format("150405")
 	t.Cleanup(func() { _ = client.Database(testDB).Drop(ctx) })
 
-	w := writer.NewMongoWriter(client, testDB, 1)
+	skips := map[string]int{}
+	w := writer.NewMongoWriter(client, testDB, 1, func(table string, n int) {
+		skips[table] += n
+	})
 	coll := client.Database(testDB).Collection("users")
 
 	// 1. INSERT at LSN=100.
@@ -136,5 +139,14 @@ func TestMongoWriter_LSNGateOrdering(t *testing.T) {
 	n, _ = coll.CountDocuments(ctx, bson.M{"_id": "users:1"})
 	if n != 1 {
 		t.Errorf("stale delete removed re-inserted doc (should have been a no-op). count=%d", n)
+	}
+
+	// LSN gate skips that the onSkip callback must have seen:
+	//   - same-LSN replay of the initial insert (E11000 on upsert),
+	//   - stale UPDATE at LSN=150 (E11000 on upsert vs the LSN=200 doc),
+	//   - stale DELETE at LSN=300 vs the re-inserted LSN=400 doc.
+	// Three events total, all on table "users".
+	if got := skips["users"]; got < 3 {
+		t.Errorf("want >=3 idempotent-skips reported on users, got %d (full map=%v)", got, skips)
 	}
 }

@@ -45,6 +45,32 @@ func TestDecode_Insert(t *testing.T) {
 	if ev.After == nil || ev.After["email"] != "alice@example.com" {
 		t.Errorf("want After.email=alice@example.com, got %v", ev.After)
 	}
+	if ev.SourceTsMs != 123 {
+		t.Errorf("want SourceTsMs=123 (from source.ts_ms), got %d", ev.SourceTsMs)
+	}
+}
+
+func TestDecode_SourceTsMissing(t *testing.T) {
+	// Snapshot reads sometimes omit source.ts_ms. The decoder must not fail
+	// and must surface 0 as "unknown" so callers can skip emitting lag.
+	key := []byte(`{"schema":{},"payload":{"id":7}}`)
+	value := []byte(`{
+		"schema":{},
+		"payload":{
+			"before":null,
+			"after":{"id":7},
+			"source":{"version":"2.6","lsn":3000,"table":"users"},
+			"op":"r"
+		}
+	}`)
+
+	ev, err := decoder.Decode(key, value)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ev.SourceTsMs != 0 {
+		t.Errorf("want SourceTsMs=0 when source.ts_ms missing, got %d", ev.SourceTsMs)
+	}
 }
 
 func TestDecode_Tombstone(t *testing.T) {
