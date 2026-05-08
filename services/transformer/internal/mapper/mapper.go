@@ -1,6 +1,14 @@
 // Package mapper applies YAML transform rules to Debezium envelope events,
 // rewriting payload.after/before field names so the sink can write the
 // target Mongo shape without per-table code.
+//
+// Rules are indexed by the schema-qualified source name (e.g. "public.users").
+// Lookups read `payload.source.schema` + `payload.source.table` from the
+// envelope itself rather than parsing the Kafka topic, so two tables with
+// the same name in different schemas (`public.users` vs `audit.users`)
+// don't silently collapse onto the same rule. We fall back to topic-tail
+// parsing only when the envelope is unreadable - mostly defensive, since
+// a valid Debezium envelope always carries source.{schema,table}.
 package mapper
 
 import (
@@ -29,7 +37,10 @@ type Rule struct {
 
 // Mapper holds the rule set keyed by source table name.
 type Mapper struct {
-	byTable map[string]*Rule
+	// Indexed by qualified name "<schema>.<table>" (e.g. "public.users").
+	// A rule whose Source has no dot is indexed as just the bare name and
+	// will only match envelopes from a default/unset schema.
+	byQName map[string]*Rule
 }
 
 // Load parses every *.yml under dir.
@@ -38,7 +49,7 @@ func Load(dir string) (*Mapper, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mapper.Load: read dir %s: %w", dir, err)
 	}
-	m := &Mapper{byTable: map[string]*Rule{}}
+	m := &Mapper{byQName: map[string]*Rule{}}
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".yml") {
 			continue
@@ -55,31 +66,41 @@ func Load(dir string) (*Mapper, error) {
 		if err := yaml.Unmarshal(b, &r); err != nil {
 			return nil, fmt.Errorf("mapper.Load: %s: %w", path, err)
 		}
-		table := tableFromSource(r.Source)
-		if table == "" {
+		key := strings.TrimSpace(r.Source)
+		if key == "" {
 			return nil, fmt.Errorf("mapper.Load: %s: empty source", path)
 		}
-		m.byTable[table] = &r
+		if existing, dup := m.byQName[key]; dup {
+			return nil, fmt.Errorf("mapper.Load: duplicate rule for source %q (already loaded with target %q)", key, existing.Target)
+		}
+		m.byQName[key] = &r
 	}
 	return m, nil
 }
 
 // ApplyJSON rewrites payload.after/before field names per the matching rule.
-// Topics with no matching rule pass through unchanged.
+// Topics with no matching rule pass through unchanged. The topic argument
+// is only used as a fallback lookup key when the envelope omits source
+// metadata - a valid Debezium event always carries source.{schema,table}
+// and we prefer those.
 func (m *Mapper) ApplyJSON(topic string, envelope []byte) ([]byte, error) {
-	table := tableFromTopic(topic)
-	rule, ok := m.byTable[table]
-	if !ok {
-		return envelope, nil
-	}
-
 	var env map[string]any
 	if err := json.Unmarshal(envelope, &env); err != nil {
-		return nil, fmt.Errorf("mapper.ApplyJSON: parse: %w", err)
+		// Not parseable as a Debezium envelope - try the topic-tail
+		// fallback so legacy / hand-written records still pass through.
+		if rule := m.lookupByTopicTail(topic); rule != nil {
+			return nil, fmt.Errorf("mapper.ApplyJSON: parse: %w", err)
+		}
+		return envelope, nil
 	}
 	payload, ok := env["payload"].(map[string]any)
 	if !ok {
 		return envelope, nil // tombstone or non-envelope; leave alone
+	}
+
+	rule := m.lookupForPayload(payload, topic)
+	if rule == nil {
+		return envelope, nil
 	}
 
 	if after, ok := payload["after"].(map[string]any); ok && after != nil {
@@ -93,24 +114,55 @@ func (m *Mapper) ApplyJSON(topic string, envelope []byte) ([]byte, error) {
 	return json.Marshal(env)
 }
 
-// Rules returns the loaded rule set keyed by source table. The
-// returned map is the live store; callers must not mutate it.
-func (m *Mapper) Rules() map[string]*Rule { return m.byTable }
+// Rules returns the loaded rule set keyed by qualified name
+// ("schema.table"). The returned map is the live store; callers must not
+// mutate it.
+func (m *Mapper) Rules() map[string]*Rule { return m.byQName }
 
-// tableFromSource: "public.users" -> "users".
-func tableFromSource(src string) string {
-	if i := strings.LastIndex(src, "."); i >= 0 {
-		return src[i+1:]
+// lookupForPayload prefers the schema/table on the envelope, falling back
+// to the topic tail. Returns nil if no rule matches.
+func (m *Mapper) lookupForPayload(payload map[string]any, topic string) *Rule {
+	src, _ := payload["source"].(map[string]any)
+	if src != nil {
+		schema, _ := src["schema"].(string)
+		table, _ := src["table"].(string)
+		if table != "" {
+			if schema != "" {
+				if r, ok := m.byQName[schema+"."+table]; ok {
+					return r
+				}
+			}
+			// Some Debezium configs strip schema; honour bare-table rules.
+			if r, ok := m.byQName[table]; ok {
+				return r
+			}
+		}
 	}
-	return src
+	return m.lookupByTopicTail(topic)
 }
 
-// tableFromTopic: "cdc.users" or "transformed.users" -> "users".
-func tableFromTopic(topic string) string {
-	if i := strings.LastIndex(topic, "."); i >= 0 {
-		return topic[i+1:]
+// lookupByTopicTail is the legacy lookup path: take the suffix after the
+// last dot in the topic name and try both bare-table and any-schema match.
+// Kept for non-Debezium producers and as a defensive backstop.
+func (m *Mapper) lookupByTopicTail(topic string) *Rule {
+	if topic == "" {
+		return nil
 	}
-	return topic
+	tail := topic
+	if i := strings.LastIndex(topic, "."); i >= 0 {
+		tail = topic[i+1:]
+	}
+	if r, ok := m.byQName[tail]; ok {
+		return r
+	}
+	// Last resort: scan for any rule whose Source ends in ".<tail>".
+	suffix := "." + tail
+	for k, r := range m.byQName {
+		if strings.HasSuffix(k, suffix) {
+			return r
+		}
+	}
+	return nil
 }
 
 func renameKeys(src map[string]any, fields map[string]FieldRule) map[string]any {
