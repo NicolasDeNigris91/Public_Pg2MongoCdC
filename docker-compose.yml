@@ -220,6 +220,8 @@ services:
         condition: service_healthy
       mongo:
         condition: service_healthy
+      mongo-init:
+        condition: service_completed_successfully
     environment:
       KAFKA_BROKERS: "kafka:29092"
       KAFKA_GROUP_ID: "zdt-sink"
