@@ -36,6 +36,10 @@ linters:
     - revive
     - unconvert
     - unparam
+    # CDC-pipeline-specific bar:
+    - prealloc    # hot-path slice growth = GC pressure during burst load
+    - errname     # ErrFoo / FooError convention for sentinels (e.g. ErrTombstone)
+    - forbidigo   # block fmt.Println/Print in services - everything goes through log
   settings:
     errcheck:
       # Ignore deferred Close() - best-effort at teardown, nothing
@@ -54,6 +58,10 @@ linters:
       disabled-checks:
         # Too noisy on intentional small branches.
         - ifElseChain
+    forbidigo:
+      forbid:
+        - pattern: '^fmt\.Print(ln|f)?$'
+          msg: "use log (or t.Logf in tests) so output is structured + filterable"
   exclusions:
     rules:
       # Test files are deliberately simpler: httptest.NewRequest without
@@ -67,6 +75,12 @@ linters:
           - gocritic
           - noctx
           - revive
+          - forbidigo  # tests print to t.Logf via t.Helper - fmt is fine in test helpers
+      # CLI tools legitimately write to stdout via fmt.Print* - that IS the
+      # contract. Long-running services must use the structured logger.
+      - path: cmd/dlqtool/
+        linters:
+          - forbidigo
 
 issues:
   max-issues-per-linter: 0

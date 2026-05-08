@@ -60,8 +60,9 @@ func makeInsert(pk, lsn int64) (key, value []byte) {
 }
 
 func TestLoop_BatchSuccess(t *testing.T) {
-	var recs []consumer.Record
-	for i, lsn := range []int64{100, 101, 102} {
+	lsns := []int64{100, 101, 102}
+	recs := make([]consumer.Record, 0, len(lsns))
+	for i, lsn := range lsns {
 		k, v := makeInsert(int64(i+1), lsn)
 		recs = append(recs, consumer.Record{Key: k, Value: v, Offset: lsn, Topic: "cdc.users"})
 	}
@@ -86,8 +87,9 @@ func TestLoop_BatchSuccess(t *testing.T) {
 // On batch failure the loop must not commit anything; the whole poll batch
 // is redelivered.
 func TestLoop_BatchFailureCommitsNothing(t *testing.T) {
-	recs := []consumer.Record{}
-	for i, lsn := range []int64{100, 101, 102} {
+	lsns := []int64{100, 101, 102}
+	recs := make([]consumer.Record, 0, len(lsns))
+	for i, lsn := range lsns {
 		k, v := makeInsert(int64(i+1), lsn)
 		recs = append(recs, consumer.Record{Key: k, Value: v, Offset: lsn, Topic: "cdc.users"})
 	}
