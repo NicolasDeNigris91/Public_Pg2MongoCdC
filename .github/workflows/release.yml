@@ -1,0 +1,128 @@
+name: release
+
+# Triggered by tag push (v*) or manual dispatch.
+#
+# Builds the three service images for linux/amd64 + linux/arm64, pushes to
+# GHCR, signs each with cosign keyless (GitHub OIDC - no key material to
+# manage), generates an SBOM per image with syft, and attests the SBOM
+# against the image signature so consumers can verify provenance with:
+#
+#   cosign verify ghcr.io/...:tag --certificate-identity-regexp '^https://github.com/...'
+#   cosign verify-attestation ghcr.io/...:tag --type spdxjson \
+#     --certificate-identity-regexp '^https://github.com/...'
+#
+# Why keyless? GitHub-OIDC -> Sigstore Fulcio issues a short-lived cert
+# per workflow run; the signature is bound to the repo + workflow + git
+# ref. No long-lived signing key to rotate or leak. The signature is
+# logged in the public Rekor transparency log.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (without leading v). Defaults to short SHA."
+        required: false
+
+permissions:
+  contents: read
+  packages: write       # push to GHCR
+  id-token: write       # OIDC for cosign keyless
+
+jobs:
+  build-sign-attest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - service: sink
+            context: services/sink
+          - service: transformer
+            context: services/transformer
+          - service: loadgen
+            context: services/loadgen
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: derive tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: build + push (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max          # SLSA provenance attached by buildx
+          sbom: true                    # buildkit-generated SBOM in image manifest
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/pg2mongo-cdc-${{ matrix.service }}:${{ steps.tag.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/pg2mongo-cdc-${{ matrix.service }}:latest
+
+      - uses: sigstore/cosign-installer@v3
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/${{ github.repository_owner }}/pg2mongo-cdc-${{ matrix.service }}@${{ steps.build.outputs.digest }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.service }}.spdx.json
+
+      - name: cosign sign (keyless)
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository_owner }}/pg2mongo-cdc-${{ matrix.service }}@${{ steps.build.outputs.digest }}
+
+      - name: cosign attest SBOM
+        run: |
+          cosign attest --yes \
+            --predicate sbom-${{ matrix.service }}.spdx.json \
+            --type spdxjson \
+            ghcr.io/${{ github.repository_owner }}/pg2mongo-cdc-${{ matrix.service }}@${{ steps.build.outputs.digest }}
+
+      - name: upload SBOM as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.spdx.json
+          retention-days: 365
+
+  github-release:
+    needs: build-sign-attest
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: gh release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF#refs/tags/}" \
+            --title "${GITHUB_REF#refs/tags/}" \
+            --notes "Container images signed with cosign (keyless via GitHub OIDC). See README and attached SBOMs for the bill of materials." \
+            artifacts/sbom-*/*.spdx.json
