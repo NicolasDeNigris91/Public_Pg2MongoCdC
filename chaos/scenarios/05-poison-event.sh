@@ -36,3 +36,13 @@ docker compose exec -T mongo mongosh --quiet \
 echo ""
 echo "Manual assertion: the 'chaos5-post' event should be present in Mongo,"
 echo "proving the poison did NOT block the pipeline."
+
+# Cleanup: the poison row is intentionally too big for Mongo (1MB JSONB
+# blob), so it lives in PG but never as a Mongo doc. Leaving it behind
+# breaks PG<->Mongo row-count parity for any subsequent scenario in the
+# same run-all session. Delete it here so the suite is composable.
+echo ""
+echo "Cleanup: removing the poison row from PG (and waiting for the DELETE to propagate) ..."
+docker compose exec -T postgres psql -U app -d app -c \
+  "DELETE FROM users WHERE email = 'chaos5-poison@test.dev';"
+sleep 5
