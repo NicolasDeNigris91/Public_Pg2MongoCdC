@@ -1,7 +1,7 @@
 # Debezium Connect + MongoDB Kafka Connector. Wire format is JsonConverter;
 # Avro + Schema Registry is a Connect-config flip when needed.
 
-FROM debezium/connect:2.6
+FROM debezium/connect:3.0.0.Final
 
 ARG MONGO_CONNECTOR_VERSION=1.13.0
 
