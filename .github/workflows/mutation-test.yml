@@ -1,0 +1,87 @@
+name: mutation-test
+
+# Mutation testing: prove the test suite catches changes that should fail
+# tests. Runs gremlins against the sink (the package with the most
+# correctness-critical logic - LSN gating, idempotent skips, checkpoint
+# heartbeat). Surfaces "lived" mutants - code modifications the suite
+# did NOT catch - as PR-quality signal.
+#
+# Schedule: nightly (cheap; gremlins on the sink runs in ~3-4 min) plus
+# on-demand. Not gating - we file findings, we don't break PRs on them.
+#
+# Reading the report:
+#   - KILLED: a mutation broke a test - good, the test caught it.
+#   - LIVED:  a mutation passed all tests - bad, gap in the suite.
+#   - NOT VIABLE: a mutation didn't compile - benign.
+#   - TIMED OUT: a mutation hung - usually infinite loop, count as KILLED.
+
+on:
+  schedule:
+    - cron: "13 4 * * *"   # 04:13 UTC nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write   # for posting summary on manual dispatch from PR
+
+jobs:
+  gremlins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+          cache: true
+          cache-dependency-path: services/sink/go.sum
+
+      - name: install gremlins
+        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@latest
+
+      - name: run mutation test on sink
+        working-directory: services/sink
+        # `unleash` runs the mutation campaign. We focus on the packages
+        # whose correctness is load-bearing: writer (LSN gate +
+        # idempotent skip detection) and checkpoint (heartbeat +
+        # gauge). Both are pure-Go, no Mongo dep at unit-test time.
+        # `--threshold-efficacy=0` means we don't fail the build - we
+        # report.
+        run: |
+          gremlins unleash \
+            --workers=2 \
+            --threshold-efficacy=0 \
+            --threshold-mcover=0 \
+            --output=gremlins-report.json \
+            ./internal/writer ./internal/checkpoint || true
+
+      - name: summarize report
+        working-directory: services/sink
+        run: |
+          if [ ! -f gremlins-report.json ]; then
+            echo "no report produced - gremlins probably errored"
+            exit 0
+          fi
+          echo "## Mutation testing report" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '
+            .Files[] |
+            .Mutants |
+            group_by(.Status) |
+            map({status: .[0].Status, count: length}) |
+            map("\(.status): \(.count)") |
+            join(" | ")
+          ' gremlins-report.json | sort -u | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Lived mutants (gaps in test coverage):" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '
+            .Files[] | .Mutants[] |
+            select(.Status == "LIVED") |
+            "- `\(.MutantType)` in \(.File):\(.Position.Line)"
+          ' gremlins-report.json | head -25 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gremlins-report
+          path: services/sink/gremlins-report.json
+          retention-days: 30
