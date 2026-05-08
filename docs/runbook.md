@@ -33,6 +33,39 @@ Every alert from `observability/prometheus/alerts.yml` has a section here. Keep 
 
 ---
 
+## ConsumerLagProbeStale
+
+**Symptom.** `migration_consumer_group_lag_age_seconds > 300` for 5 minutes.
+
+The sink runs an in-process probe (every 30s) that asks Kafka for its
+own consumer-group lag. This alert says the probe has not succeeded in
+over 5 minutes, even though the metrics endpoint is responding. That
+means the sink can serve scrapes but cannot reach the broker's
+admin API.
+
+**Likely causes.**
+
+1. Broker ACLs changed and the sink's principal lost `Describe` on the
+   consumer group.
+2. NetworkPolicy / SecurityGroup tightened and admin port is no longer
+   reachable from the sink pod.
+3. KRaft controller in a bad state (rare; correlate with
+   `kafka_controller_*` metrics).
+
+**Check.**
+
+```bash
+kubectl exec -n pg2mongo-cdc deploy/sink -- /bin/sh -c \
+  "wget -qO- http://localhost:8080/metrics | grep migration_consumer_group_lag"
+```
+
+If `migration_consumer_group_lag_age_seconds` keeps growing, the in-process
+probe is failing. Check sink logs for `lag probe:` lines for the broker
+error. The data-plane (consume / produce) may still be working - lag
+just becomes invisible.
+
+---
+
 ## DLQNonEmpty
 
 **Symptom.** At least one message in a `dlq.*` topic.
@@ -48,13 +81,20 @@ docker compose exec kafka kafka-console-consumer \
 
 The headers include: `__dlq_error_reason`, `__dlq_source_offset`, `__dlq_source_topic`. These tell you what, where, and why.
 
-**Reprocessing.** Once the root cause is fixed in code / config, replay:
+**Reprocessing.** Once the root cause is fixed in code / config, triage first:
 
 ```bash
-./scripts/reprocess-dlq.sh dlq.source      # reads, re-validates, re-produces
+make reprocess-dlq                              # dry-run: counts by reason + source topic
+make reprocess-dlq ARGS="dlq.source"            # one topic only
 ```
 
-Never `kafka-console-producer` the old event back verbatim - it will fail the same way.
+When you are confident the root cause is fixed, replay:
+
+```bash
+make reprocess-dlq ARGS="dlq.source --replay"   # re-publishes to __dlq_source_topic
+```
+
+The replayer preserves key + value bytes verbatim and uses the `__dlq_source_topic` header to route. If the same poison shape repeats it will land back in the DLQ with fresh provenance — never `kafka-console-producer` an old event back without first fixing the underlying schema/code, or you'll just rebuild the same DLQ.
 
 ---
 
@@ -82,6 +122,38 @@ Fires when `sink-svc` has stopped writing `_migration_checkpoints` docs. It usua
 3. Disk full on Mongo data volume.
 
 **Check.** `docker compose exec mongo mongosh --eval "rs.status()"`.
+
+---
+
+## SinkApplyStuck
+
+**Symptom.** `migration_consecutive_apply_failures > 5` for 2 minutes.
+
+The sink has failed every batch for the last few minutes. It is now
+sleeping ~30s between retries (the backoff cap, kept under Kafka's
+`max.poll.interval.ms` so the consumer is not kicked out of the group).
+Data is NOT being lost — the LSN gate ensures duplicates are no-ops on
+recovery — but Mongo (or whatever the immediate downstream is) is
+unreachable / rejecting writes.
+
+**First move.** Look at `migration_write_errors_total` by `reason`:
+
+```
+sum(increase(migration_write_errors_total[5m])) by (reason)
+```
+
+- `reason="connection"` -> Mongo unreachable. Check pod-to-Mongo
+  network reachability + DNS.
+- `reason="timeout"` -> Mongo overloaded (CPU / IO). Check
+  `mongo_op_counters_repl` and `mongo_connections_current`.
+- `reason="server"` / `reason="duplicate_key"` (unexpected) -> read
+  the sink logs - the underlying Mongo error is wrapped in the log
+  line.
+- `reason="context"` -> we are shutting down; the alert will clear.
+
+If the sink is healthy but the alert keeps re-firing, investigate
+in-flight batch size — `BulkWrite` >16MB silently fails on Mongo and
+the batch will redeliver in a tighter loop.
 
 ---
 

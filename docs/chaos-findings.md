@@ -302,6 +302,190 @@ Two things worth carrying forward into operations:
    debug. Worth a one-time audit of every other client option in the
    stack against its broker counterpart.
 
+## Instrumentation completeness pass
+
+A pre-release audit revealed that three of six Prometheus alerts in
+`observability/prometheus/alerts.yml` referenced metric series that
+were declared but never observed by any production code path:
+
+- `migration_replication_lag_seconds` — registered as a `HistogramVec`
+  but nothing called `.Observe()` outside its own metrics test.
+- `migration_idempotent_skip_total` — registered as a `CounterVec` but
+  nothing called `.Inc()` / `.Add()` outside its own metrics test.
+- `migration_checkpoint_staleness_seconds` and the
+  `_migration_checkpoints` collection — both referenced in
+  [ADR-003](./decisions/003-commit-after-sideeffect.md), the runbook,
+  and the architecture doc, but no Go code actually wrote the doc or
+  emitted the gauge.
+
+The `make reprocess-dlq` target also returned `NOT YET IMPLEMENTED`
+despite being advertised in the README and runbook.
+
+### Fix
+
+| Gap | Closing change |
+|---|---|
+| `migration_replication_lag_seconds` never observed | Added `SourceTsMs` to `CDCEvent`, decoded `payload.source.ts_ms` in `decoder`, observed `now() - SourceTsMs` per event in the `instrumentedWriter` (clamped at 0 for clock skew). |
+| `migration_idempotent_skip_total` never incremented | `NewMongoWriter` now takes an `onSkip(table, n)` callback. `MongoWriter.ApplyBatch` derives the per-table skip count from `BulkWriteResult.{MatchedCount, UpsertedCount, DeletedCount}` against `len(models)` AND from the all-E11000 path. `cmd/sink` wires the callback to the counter. |
+| Checkpoint doc + staleness gauge missing | New `internal/checkpoint` package: in-memory atomic progress (`MarkProgress(maxLSN, n)`), 10s ticker that upserts `_migration_checkpoints`, `prometheus.NewGaugeFunc` that reports `time.Since(lastSuccessfulFlush)` on every scrape. Wired through `instrumentedWriter`; final flush on shutdown. |
+| `make reprocess-dlq` was a stub | New `services/sink/cmd/dlqtool/` Go CLI: dry-run summary by `__dlq_error_reason` and `__dlq_source_topic`; `--replay` re-publishes verbatim to the original topic. Bash wrapper builds a distroless image on demand and runs it on the compose network. |
+| `classify(err)` substring-matched on `err.Error()` | Rewritten with `errors.Is(context.Canceled / DeadlineExceeded)`, `errors.As(net.Error)`, and `errors.As(mongo.ServerError)` (with `HasErrorCode(11000)` and `HasErrorLabel("RetryableWriteError")` discrimination). |
+| Multi-schema rule collision in transformer | `Mapper` now indexes by qualified name (`<schema>.<table>`); `ApplyJSON` reads `payload.source.{schema,table}` from the envelope as the lookup key, falling back to topic-tail only if the envelope is malformed. New tests cover `public.users` vs `audit.users` isolation and duplicate-source detection. |
+
+### Regression guard
+
+To prevent the same drift from re-opening, `scripts/check-alert-metrics.sh`
+runs in CI and fails the build if either:
+
+- a `migration_*` token in `alerts.yml` has no producer in `services/`, or
+- a metric field declared on the `Metrics` struct is never touched by
+  `.Inc / .Add / .Observe / .Set / .WithLabelValues` outside the
+  metrics package and `*_test.go` files.
+
+Verified by deliberately renaming a metric in `alerts.yml`: the script
+exits 1 with `DRIFT DETECTED: 1 error(s)`.
+
+### Chaos coverage of the new mechanism
+
+`chaos/scenarios/06-checkpoint-recovery.sh` sends background load,
+captures the pre-kill checkpoint doc, SIGKILLs the sink, restarts it,
+pushes fresh writes, then polls `_migration_checkpoints` directly until
+both `lastLSN` and `updatedAt` advance past the pre-kill snapshot. Once
+the doc has demonstrably been re-written, it asserts the staleness
+gauge reads `< 30s` (proving the gauge tracks the same in-memory state
+that produced the persisted doc). Final integrity check via
+`verify-integrity.sh`.
+
+Picked up automatically by `chaos/run-all.sh` (glob discovery).
+
+## World-class layer — 2026-05-08
+
+The hardening pass left three legitimate world-class items on the
+table. This pass closes them.
+
+| Item | Closing change |
+|---|---|
+| No distributed tracing — given a wrong Mongo doc, no way to walk back through the pipeline | `internal/tracing/` package (sink + transformer; small, intentional duplication rather than a workspace). OTLP/gRPC exporter, propagator install. Spans on `transformer.process_record`, `sink.consume_batch`, `sink.apply_batch`, `sink.mongo_bulk_write`. Trace context propagates via Kafka headers (`traceparent`). Jaeger all-in-one in chaos overlay on `http://localhost:16686`. |
+| Container images unsigned (no provenance verification possible) | `.github/workflows/release.yml` builds multi-arch (`linux/amd64`, `linux/arm64`), pushes to GHCR, signs with cosign keyless via GitHub OIDC, attests SBOM (SPDX-JSON) generated by `syft`. Consumer can `cosign verify` + `cosign verify-attestation` against any released tag. Per-push CI also produces SBOMs as artifacts. |
+| Test suite never measured for *catching* bugs (only for not-failing) | `.github/workflows/mutation-test.yml` runs `gremlins unleash` nightly against `internal/writer` (LSN gate + skip detection) and `internal/checkpoint` (heartbeat + gauge). LIVED mutants surface as PR-quality findings — gaps where a code change wouldn't break any test. Non-gating; reports only. |
+
+### Tracing trade-offs accepted
+
+- **Cardinality:** every record = one trace + 4 spans. With 33k
+  events/15s in a k6 burst that's ~9k spans/s. Fine for a portfolio
+  project + Jaeger badger storage; production should switch
+  `AlwaysSample` → `ParentBased(TraceIDRatio(0.01))` via env if
+  cardinality bites.
+- **Opt-in via env:** `OTEL_EXPORTER_OTLP_ENDPOINT` unset → noop
+  tracer + propagator-only install. The base `make demo` topology
+  costs zero at runtime. Tracing turns on only with the chaos
+  overlay.
+- **Two services duplicate the small `tracing` package:** intentional.
+  Both modules stay self-contained (no `go.work`). Migrate to
+  `pkg/tracing/` if a 4th service appears.
+
+### Cosign verification example
+
+After a `vX.Y.Z` tag is pushed:
+
+```bash
+# Verify the image was signed by this workflow + repo:
+cosign verify ghcr.io/nicolasdenigris91/pg2mongo-cdc-sink:X.Y.Z \
+  --certificate-identity-regexp '^https://github.com/NicolasDeNigris91/Public_Pg2MongoCdC' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# Verify the SPDX SBOM attestation is present:
+cosign verify-attestation ghcr.io/nicolasdenigris91/pg2mongo-cdc-sink:X.Y.Z \
+  --type spdxjson \
+  --certificate-identity-regexp '^https://github.com/NicolasDeNigris91/Public_Pg2MongoCdC' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+Both succeed only if the image came from this exact workflow on this
+exact repo with a Sigstore-validated short-lived certificate.
+
+## Hardening pass — 2026-05-07 evening
+
+After the instrumentation completeness pass landed, a second sweep
+closed the smaller gaps that separate "alerts wired" from "alerts
+trustworthy":
+
+| Gap | Closing change |
+|---|---|
+| Idle pipeline trips `CheckpointStaleness` because no flush ever fires | Checkpointer now heartbeats every Nth interval (default 6 = 60s), so a healthy idle sink keeps the gauge bounded. Stalled-loop detection is delegated to `ConsumerLagHigh`, the right tool. |
+| `/metrics` had no process / runtime visibility | `metrics.New()` registers `collectors.NewGoCollector()` and `NewProcessCollector()` so on-call can correlate `migration_replication_lag_seconds` spikes with `go_gc_duration_seconds`, `go_goroutines` and `process_resident_memory_bytes` without a separate exporter. |
+| `ConsumerLagHigh` only fired in dev (kafka-exporter is in the chaos overlay only, not in prod / Helm) | New `internal/lag` package: in-process probe via `kadm.Lag(ctx, group)` every 30s. Emits `migration_consumer_group_lag` and `migration_consumer_group_lag_age_seconds`. The alert now reads `(migration_consumer_group_lag or kafka_exporter_fallback)`, working in every deployment. |
+| Helm chart had no `PrometheusRule` (alerts only existed in `observability/`) | Added `templates/prometheusrule.yaml` mirroring `alerts.yml`. Thresholds parameterised via `prometheusRule.thresholds.*` in `values.yaml`. |
+| `make load` had no CDC-side SLO assertion (k6 only covered HTTP latency, not pipeline lag) | New `scripts/check-load-slos.sh` queries Prometheus for `migration_replication_lag_seconds` p99 and `migration_write_errors_total` rate. Exits non-zero on breach. Hooked up via `make load-slo`. |
+
+### Live verification - 2026-05-07 evening
+
+`/metrics` from the running sink shows every series:
+
+```
+go_gc_duration_seconds_count 13
+go_goroutines 28
+go_info{version="go1.26.2"} 1
+process_resident_memory_bytes 24694784
+migration_consumer_group_lag 1178
+migration_consumer_group_lag_age_seconds 9.51
+migration_replication_lag_seconds_count{table="users"} 25
+migration_checkpoint_staleness_seconds 12.4
+migration_events_processed_total{op="c",stage="sink",table="users"} 25
+```
+
+`bash chaos/run-all.sh` after the changes: **6/6 PASS, INTEGRITY OK.**
+
+`scripts/check-load-slos.sh` exit-code matrix verified after a 15s /
+10 VU k6 burst (33,057 requests, 0 HTTP failures):
+
+| Budget | p99 measured | Outcome | Exit |
+|---|---|---|---|
+| `LAG_P99_BUDGET_SECS=30 WINDOW=1m` | 9.66s | within budget | 0 |
+| `LAG_P99_BUDGET_SECS=1` (default 5m window) | 9.99s | OVER budget | 1 |
+
+The script enforces what it claims to enforce.
+
+### Live verification - 2026-05-07
+
+Brought up the full stack (`docker compose -f docker-compose.yml -f
+docker-compose.chaos.yml up -d --build --wait`), seeded data, and
+confirmed every series the audit said was missing is now produced:
+
+```
+migration_checkpoint_staleness_seconds 13.180120052
+migration_events_processed_total{op="c",stage="sink",table="users"} 25
+migration_replication_lag_seconds_count{table="users"} 25
+migration_replication_lag_seconds_sum{table="users"}   529.17
+migration_replication_lag_seconds_bucket{...le="30"}   25
+```
+
+Prometheus scrape resolves them too:
+
+```
+{"__name__":"migration_checkpoint_staleness_seconds","instance":"sink:8080","job":"sink"} = 28.58
+```
+
+Checkpoint doc visible in Mongo (use `getCollection`, not dot-access -
+collection names starting with `_` are shadowed by mongosh internals):
+
+```js
+db.getCollection("_migration_checkpoints").findOne()
+// { _id: "zdt-sink", lastLSN: 27106736, lastEvents: 25,
+//   updatedAt: 2026-05-07T23:23:18.451Z }
+```
+
+Scenario 06 in isolation: pre-kill `lastLSN=27155696`, post-recovery
+`lastLSN=27162824`, `updatedAt` advanced by 55s, gauge=2.69s, integrity
+PG=422 / Mongo=422 hash match. **PASS.**
+
+Full `chaos/run-all.sh` exposed a *separate* pre-existing bug along the
+way: scenario 05 leaves a 1MB poison row in Postgres that intentionally
+never reaches Mongo (it's the proof-of-DLQ-routing point of the
+scenario), so `verify-integrity.sh` running after 05 sees a 1-row
+phantom drift forever. Scenario 05 now deletes its own poison row at
+the end so the suite is composable. Re-run: **6/6 PASS, INTEGRITY OK**.
+
 ## What's still next
 
 1. **CI runs the full chaos suite on PR labels.** Today CI runs
@@ -311,10 +495,6 @@ Two things worth carrying forward into operations:
 2. **Shipping a Helm chart** in `deploy/helm/` so deploy artifact
    demonstrates production-shape topology (RF=3 Kafka, 3-node Mongo
    replica set), not the dev-grade compose used for local demos.
-3. **`docs/operations.md` + `docs/runbook.md` per-alert.** The runbook
-   skeleton exists; populating it with the alerts we now know to
-   watch (cold-start hang, replication lag, sink consumer-group lag)
-   is the next iteration.
 
 ## Reproduction
 

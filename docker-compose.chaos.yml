@@ -77,6 +77,47 @@ services:
     volumes:
       - ./observability/toxiproxy:/etc/toxiproxy:ro
 
+  # Jaeger all-in-one as the OTLP/gRPC collector + UI. The transformer
+  # and sink discover it via OTEL_EXPORTER_OTLP_ENDPOINT (set on each
+  # service in the same overlay). UI on :16686 surfaces the end-to-end
+  # transformer -> sink -> mongo trace per record.
+  jaeger:
+    image: jaegertracing/all-in-one:1.61.0
+    container_name: zdt-jaeger
+    restart: unless-stopped
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"   # UI
+      - "4317:4317"                        # OTLP gRPC (services connect here)
+      - "4318:4318"                        # OTLP HTTP (unused but exposed)
+
+  # ------------------------------------------------------------------
+  # Service overrides: when the chaos overlay is up, point sink and
+  # transformer at the Jaeger OTLP collector. Base compose leaves
+  # OTEL_EXPORTER_OTLP_ENDPOINT unset so `make demo` stays lean and
+  # tracing is opt-in via this overlay.
+  # ------------------------------------------------------------------
+  sink:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+    depends_on:
+      jaeger:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+
+  transformer:
+    environment:
+      OTEL_EXPORTER_OTLP_ENDPOINT: "jaeger:4317"
+    depends_on:
+      jaeger:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+
   # Run on-demand: `docker compose run --rm k6`
   # Caller can override: `... run --rm -e BASE=http://loadgen:8080 k6 run --vus 20 --duration 30s /scripts/write-mix.js`
   k6:
