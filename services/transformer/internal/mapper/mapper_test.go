@@ -105,3 +105,100 @@ fields:
 		t.Errorf("want null passed through, got %s", out)
 	}
 }
+
+// Two schemas with a same-named table must not collide on the same rule.
+// Before the qname index this test was impossible to write because both
+// "public.users" and "audit.users" resolved to the bare key "users".
+func TestApplyJSON_MultiSchemaIsolation(t *testing.T) {
+	dir := t.TempDir()
+	writeRuleFile(t, dir, "public_users.yml", `
+source: public.users
+target: users
+fields:
+  full_name: { target: fullName }
+`)
+	writeRuleFile(t, dir, "audit_users.yml", `
+source: audit.users
+target: audit_users
+fields:
+  full_name: { target: fullNameAudited }
+`)
+	m, err := mapper.Load(dir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	publicEv := []byte(`{"payload":{
+		"after":{"id":1,"full_name":"Alice"},
+		"source":{"schema":"public","table":"users","lsn":1},"op":"c"
+	}}`)
+	auditEv := []byte(`{"payload":{
+		"after":{"id":1,"full_name":"Alice"},
+		"source":{"schema":"audit","table":"users","lsn":1},"op":"c"
+	}}`)
+
+	pubOut, err := m.ApplyJSON("cdc.public.users", publicEv)
+	if err != nil {
+		t.Fatalf("public ApplyJSON: %v", err)
+	}
+	audOut, err := m.ApplyJSON("cdc.audit.users", auditEv)
+	if err != nil {
+		t.Fatalf("audit ApplyJSON: %v", err)
+	}
+
+	var pub, aud map[string]any
+	_ = json.Unmarshal(pubOut, &pub)
+	_ = json.Unmarshal(audOut, &aud)
+	pubAfter := pub["payload"].(map[string]any)["after"].(map[string]any)
+	audAfter := aud["payload"].(map[string]any)["after"].(map[string]any)
+
+	if _, ok := pubAfter["fullName"]; !ok {
+		t.Errorf("public.users rule did not apply: %v", pubAfter)
+	}
+	if _, bad := pubAfter["fullNameAudited"]; bad {
+		t.Errorf("public.users picked up audit.users rule: %v", pubAfter)
+	}
+	if _, ok := audAfter["fullNameAudited"]; !ok {
+		t.Errorf("audit.users rule did not apply: %v", audAfter)
+	}
+	if _, bad := audAfter["fullName"]; bad {
+		t.Errorf("audit.users picked up public.users rule: %v", audAfter)
+	}
+}
+
+// When the envelope is missing source.{schema,table} (some snapshot reads
+// or hand-published events), we still want the topic-tail fallback to
+// resolve a single-schema rule rather than silently passing through.
+func TestApplyJSON_TopicTailFallbackWhenSourceMissing(t *testing.T) {
+	dir := t.TempDir()
+	writeRuleFile(t, dir, "users.yml", `
+source: public.users
+target: users
+fields:
+  full_name: { target: fullName }
+`)
+	m, _ := mapper.Load(dir)
+
+	// Envelope with NO source block.
+	in := []byte(`{"payload":{"after":{"id":1,"full_name":"Alice"},"op":"c"}}`)
+
+	out, err := m.ApplyJSON("cdc.public.users", in)
+	if err != nil {
+		t.Fatalf("ApplyJSON: %v", err)
+	}
+	var env map[string]any
+	_ = json.Unmarshal(out, &env)
+	after := env["payload"].(map[string]any)["after"].(map[string]any)
+	if _, ok := after["fullName"]; !ok {
+		t.Errorf("topic-tail fallback failed: %v", after)
+	}
+}
+
+func TestLoad_DuplicateSourceIsError(t *testing.T) {
+	dir := t.TempDir()
+	writeRuleFile(t, dir, "a.yml", "source: public.users\ntarget: users\nfields: {}\n")
+	writeRuleFile(t, dir, "b.yml", "source: public.users\ntarget: users_v2\nfields: {}\n")
+	if _, err := mapper.Load(dir); err == nil {
+		t.Fatal("want error on duplicate source, got nil")
+	}
+}

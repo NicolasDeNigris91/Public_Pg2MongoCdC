@@ -16,8 +16,13 @@ import (
 	"time"
 
 	"transformer/internal/mapper"
+	"transformer/internal/tracing"
 
 	"github.com/twmb/franz-go/pkg/kgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 func main() {
@@ -37,6 +42,18 @@ func main() {
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	tracingShutdown, err := tracing.Init(rootCtx, "transformer", "dev")
+	if err != nil {
+		log.Fatalf("tracing init: %v", err) //nolint:gocritic
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if terr := tracingShutdown(ctx); terr != nil {
+			log.Printf("tracing shutdown: %v", terr)
+		}
+	}()
 
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
@@ -88,6 +105,13 @@ func main() {
 // transformed.<suffix>, and commits offsets of every record that produced
 // successfully. Returns the first apply/produce error so the caller can
 // decide whether to back off.
+//
+// Tracing: each record's span starts as a root (Debezium does not
+// inject `traceparent` today) and propagates downstream via the
+// outgoing record's headers - injected by the OTel TextMapPropagator
+// so the sink resumes the same trace ID. End-to-end view in Jaeger
+// shows transformer.process_record -> sink.consume_batch ->
+// sink.apply_batch -> sink.mongo_bulk_write for every event.
 func runOnce(ctx context.Context, client *kgo.Client, m *mapper.Mapper) error {
 	fetches := client.PollFetches(ctx)
 	if ctx.Err() != nil {
@@ -104,26 +128,44 @@ func runOnce(ctx context.Context, client *kgo.Client, m *mapper.Mapper) error {
 		if firstErr != nil {
 			return
 		}
-		// Tombstone: forward unchanged (sink recognises nil value).
+		recordCtx, span := tracing.Tracer().Start(ctx, "transformer.process_record",
+			trace.WithSpanKind(trace.SpanKindConsumer),
+			trace.WithAttributes(
+				attribute.String("messaging.system", "kafka"),
+				attribute.String("messaging.destination.name", r.Topic),
+				attribute.Int64("messaging.kafka.partition", int64(r.Partition)),
+				attribute.Int64("messaging.kafka.offset", r.Offset),
+			),
+		)
+
+		out := &kgo.Record{Topic: targetTopic(r.Topic), Key: r.Key}
 		if r.Value == nil {
-			out := &kgo.Record{Topic: targetTopic(r.Topic), Key: r.Key, Value: nil}
-			if err := client.ProduceSync(ctx, out).FirstErr(); err != nil {
+			// Tombstone: forward unchanged (sink recognises nil value).
+			out.Value = nil
+		} else {
+			transformed, err := m.ApplyJSON(r.Topic, r.Value)
+			if err != nil {
+				span.RecordError(err)
+				span.SetStatus(codes.Error, "apply rules failed")
+				span.End()
 				firstErr = err
 				return
 			}
-			committable = append(committable, r)
-			return
+			out.Value = transformed
 		}
-		transformed, err := m.ApplyJSON(r.Topic, r.Value)
-		if err != nil {
+
+		// Inject trace context into the outgoing record's headers so
+		// the sink can extract and continue the same trace.
+		otel.GetTextMapPropagator().Inject(recordCtx, tracing.NewKafkaHeaderCarrier(&out.Headers))
+
+		if err := client.ProduceSync(recordCtx, out).FirstErr(); err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, "produce failed")
+			span.End()
 			firstErr = err
 			return
 		}
-		out := &kgo.Record{Topic: targetTopic(r.Topic), Key: r.Key, Value: transformed}
-		if err := client.ProduceSync(ctx, out).FirstErr(); err != nil {
-			firstErr = err
-			return
-		}
+		span.End()
 		committable = append(committable, r)
 	})
 
