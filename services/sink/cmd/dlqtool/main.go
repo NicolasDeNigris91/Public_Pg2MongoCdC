@@ -37,7 +37,6 @@ import (
 	"time"
 
 	"github.com/twmb/franz-go/pkg/kadm"
-	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
@@ -69,8 +68,10 @@ func main() {
 
 	brokerList := strings.Split(*brokers, ",")
 
-	// Step 1: snapshot the high-water-mark so we know when to stop.
-	endOffsets, exists, err := topicEndOffsets(ctx, brokerList, *topic)
+	// Step 1: snapshot start + end offsets so we know how many records
+	// are actually in the topic right now (end - start, accounting for
+	// retention truncation or compaction) and when to stop.
+	startOffsets, endOffsets, exists, err := topicOffsets(ctx, brokerList, *topic)
 	if err != nil {
 		log.Printf("dlqtool: list offsets for %s: %v", *topic, err)
 		os.Exit(1) //nolint:gocritic // boot-time fatal; no useful cleanup at this point
@@ -79,8 +80,8 @@ func main() {
 		log.Printf("dlqtool: topic %q does not exist (no DLQ activity yet?)", *topic)
 		os.Exit(2)
 	}
-	if totalLag(endOffsets) == 0 {
-		fmt.Printf("dlqtool: %s is empty (high-water-mark sums to 0). Nothing to do.\n", *topic)
+	if totalLag(startOffsets, endOffsets) == 0 {
+		fmt.Printf("dlqtool: %s is empty. Nothing to do.\n", *topic)
 		return
 	}
 
@@ -116,8 +117,8 @@ func main() {
 	if *replay {
 		mode = "REPLAY"
 	}
-	target := totalLag(endOffsets)
-	fmt.Printf("dlqtool [%s]: scanning %s, end offsets=%v (target ~%d records)\n", mode, *topic, endOffsets, target)
+	target := totalLag(startOffsets, endOffsets)
+	fmt.Printf("dlqtool [%s]: scanning %s, start=%v end=%v (~%d records to process)\n", mode, *topic, startOffsets, endOffsets, target)
 
 	reasons := map[string]int{}
 	bySourceTopic := map[string]int{}
@@ -213,37 +214,48 @@ scan:
 	}
 }
 
-func topicEndOffsets(ctx context.Context, brokers []string, topic string) (map[int32]int64, bool, error) {
+func topicOffsets(ctx context.Context, brokers []string, topic string) (start, end map[int32]int64, exists bool, err error) {
 	adm, err := kgo.NewClient(kgo.SeedBrokers(brokers...))
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
 	defer adm.Close()
 	a := kadm.NewClient(adm)
 
-	listed, err := a.ListEndOffsets(ctx, topic)
+	listedEnd, err := a.ListEndOffsets(ctx, topic)
 	if err != nil {
-		return nil, false, err
+		return nil, nil, false, err
 	}
-	out := map[int32]int64{}
-	exists := false
-	listed.Each(func(o kadm.ListedOffset) {
+	listedStart, err := a.ListStartOffsets(ctx, topic)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	end = map[int32]int64{}
+	start = map[int32]int64{}
+	listedEnd.Each(func(o kadm.ListedOffset) {
 		if o.Err != nil {
-			if errors.Is(o.Err, kerr.UnknownTopicOrPartition) {
-				return
-			}
 			return
 		}
 		exists = true
-		out[o.Partition] = o.Offset
+		end[o.Partition] = o.Offset
 	})
-	return out, exists, nil
+	listedStart.Each(func(o kadm.ListedOffset) {
+		if o.Err == nil {
+			start[o.Partition] = o.Offset
+		}
+	})
+	return start, end, exists, nil
 }
 
-func totalLag(end map[int32]int64) int64 {
+// totalLag returns the number of records currently in the topic,
+// summed across partitions as end - start. For typical DLQs (no
+// compaction, no retention truncation) start is 0 and the result
+// equals the cumulative end offsets, but for compacted or
+// retention-truncated topics this is the only correct count.
+func totalLag(start, end map[int32]int64) int64 {
 	var n int64
-	for _, v := range end {
-		n += v
+	for p, e := range end {
+		n += e - start[p]
 	}
 	return n
 }
