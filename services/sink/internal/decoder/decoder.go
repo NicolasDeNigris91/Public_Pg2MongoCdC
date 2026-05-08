@@ -39,6 +39,7 @@ type valueEnvelope struct {
 		Source struct {
 			LSN   json.Number `json:"lsn"`
 			Table string      `json:"table"`
+			TsMs  json.Number `json:"ts_ms"`
 		} `json:"source"`
 		Op string `json:"op"`
 	} `json:"payload"`
@@ -68,17 +69,29 @@ func Decode(key, value []byte) (writer.CDCEvent, error) {
 		return writer.CDCEvent{}, fmt.Errorf("decoder.Decode: lsn: %w", err)
 	}
 
+	// source.ts_ms is best-effort. Snapshot reads ("r") sometimes carry 0
+	// or omit the field; we propagate whatever we got and let downstream
+	// treat 0 as "unknown" rather than reject the event for a missing
+	// observability-only field.
+	var sourceTsMs int64
+	if s := v.Payload.Source.TsMs.String(); s != "" {
+		if n, perr := v.Payload.Source.TsMs.Int64(); perr == nil {
+			sourceTsMs = n
+		}
+	}
+
 	pk := string(k.Payload.ID)
 	if pk == "" {
 		return writer.CDCEvent{}, errors.New("decoder.Decode: empty PK in key payload")
 	}
 
 	return writer.CDCEvent{
-		Table:  v.Payload.Source.Table,
-		PK:     pk,
-		LSN:    lsn,
-		Op:     writer.CDCOp(v.Payload.Op),
-		After:  v.Payload.After,
-		Before: v.Payload.Before,
+		Table:      v.Payload.Source.Table,
+		PK:         pk,
+		LSN:        lsn,
+		SourceTsMs: sourceTsMs,
+		Op:         writer.CDCOp(v.Payload.Op),
+		After:      v.Payload.After,
+		Before:     v.Payload.Before,
 	}, nil
 }

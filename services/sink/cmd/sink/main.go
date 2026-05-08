@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -26,9 +27,12 @@ import (
 	"syscall"
 	"time"
 
+	"zdt/sink/internal/checkpoint"
 	"zdt/sink/internal/consumer"
 	"zdt/sink/internal/kafka"
+	"zdt/sink/internal/lag"
 	"zdt/sink/internal/metrics"
+	"zdt/sink/internal/tracing"
 	"zdt/sink/internal/writer"
 
 	"go.mongodb.org/mongo-driver/v2/mongo"
@@ -50,6 +54,21 @@ func main() {
 	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	// Tracing: opt-in via OTEL_EXPORTER_OTLP_ENDPOINT. No-op shutdown if
+	// unset (production deployments without an OTLP collector keep
+	// running with zero overhead beyond the propagator install).
+	tracingShutdown, err := tracing.Init(rootCtx, "sink", "dev")
+	if err != nil {
+		log.Fatalf("tracing init: %v", err)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if terr := tracingShutdown(ctx); terr != nil {
+			log.Printf("tracing shutdown: %v", terr)
+		}
+	}()
+
 	// Mongo
 	mClient, err := mongo.Connect(options.Client().ApplyURI(mongoURI))
 	if err != nil {
@@ -63,10 +82,14 @@ func main() {
 		defer cancel()
 		_ = mClient.Disconnect(ctx)
 	}()
-	mongoWriter := writer.NewMongoWriter(mClient, mongoDB, schemaVer)
-
-	// Metrics + health server
+	// Metrics + health server (constructed first so the writer's onSkip
+	// callback can target the registered counter directly).
 	m := metrics.New()
+
+	mongoWriter := writer.NewMongoWriter(mClient, mongoDB, schemaVer, func(table string, n int) {
+		m.IdempotentSkip.WithLabelValues(table).Add(float64(n))
+	})
+
 	srv := &http.Server{
 		Addr:              metricsAddr,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -90,15 +113,55 @@ func main() {
 	}
 	defer kc.Close()
 
-	// Instrumented writer wraps MongoWriter to record metrics per event.
-	instrumented := newInstrumentedWriter(mongoWriter, m)
+	// Checkpointer: persists per-group progress to Mongo and exposes the
+	// migration_checkpoint_staleness_seconds gauge feeding the
+	// CheckpointStaleness alert. It registers its own collector on m.Reg.
+	cp := checkpoint.New(mClient, mongoDB, m.Reg, checkpoint.Config{
+		GroupID:      groupID,
+		Interval:     10 * time.Second,
+		FlushTimeout: 5 * time.Second,
+		Logf:         log.Printf,
+	})
+	go cp.Run(rootCtx)
+
+	// Lag probe: consults Kafka admin for the consumer group's per-partition
+	// lag and exposes migration_consumer_group_lag. Co-located with the
+	// process so the ConsumerLagHigh alert no longer depends on a separate
+	// kafka-exporter being deployed.
+	lp := lag.New(kc.Client(), m.Reg, lag.Config{
+		GroupID:      groupID,
+		Interval:     30 * time.Second,
+		ProbeTimeout: 5 * time.Second,
+		Logf:         log.Printf,
+	})
+	go lp.Run(rootCtx)
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if ferr := cp.Flush(ctx); ferr != nil {
+			log.Printf("final checkpoint flush: %v", ferr)
+		}
+	}()
+
+	// Instrumented writer wraps MongoWriter to record metrics + progress.
+	instrumented := newInstrumentedWriter(mongoWriter, m, cp)
 	loop := &consumer.Loop{Cons: kc, W: instrumented, SchemaVer: schemaVer}
 
-	runLoop(rootCtx, loop)
+	runLoop(rootCtx, loop, m)
 	log.Printf("sink stopped")
 }
 
-func runLoop(ctx context.Context, loop *consumer.Loop) {
+// Backoff schedule on consecutive ApplyBatch / Poll failures. Capped at
+// maxBackoff which MUST stay well below Kafka's max.poll.interval.ms
+// (default 5m): if we sleep longer than that the broker kicks us out of
+// the consumer group and we lose the assignment.
+const (
+	baseBackoff = 500 * time.Millisecond
+	maxBackoff  = 30 * time.Second
+)
+
+func runLoop(ctx context.Context, loop *consumer.Loop, m *metrics.Metrics) {
+	consecutive := 0
 	for {
 		if ctx.Err() != nil {
 			return
@@ -107,14 +170,38 @@ func runLoop(ctx context.Context, loop *consumer.Loop) {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return
 			}
-			log.Printf("loop error, backoff 1s: %v", err)
+			consecutive++
+			m.ConsecutiveFailures.Set(float64(consecutive))
+			delay := backoffDuration(consecutive)
+			log.Printf("loop error (consecutive=%d, backoff=%s): %v", consecutive, delay, err)
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(time.Second):
+			case <-time.After(delay):
 			}
+			continue
+		}
+		if consecutive != 0 {
+			log.Printf("loop recovered after %d consecutive failures", consecutive)
+			consecutive = 0
+			m.ConsecutiveFailures.Set(0)
 		}
 	}
+}
+
+// backoffDuration returns the sleep before retry n (1-based). Doubles
+// every step (binary exponential), clamped at maxBackoff. No jitter -
+// our retries are bounded and the broker side has no thundering-herd
+// concern (single-instance retry per partition).
+func backoffDuration(n int) time.Duration {
+	if n <= 0 {
+		return baseBackoff
+	}
+	d := baseBackoff << (n - 1) // 500ms, 1s, 2s, 4s, ...
+	if d <= 0 || d > maxBackoff {
+		return maxBackoff
+	}
+	return d
 }
 
 func buildHTTPMux(m *metrics.Metrics) http.Handler {
@@ -124,16 +211,17 @@ func buildHTTPMux(m *metrics.Metrics) http.Handler {
 	return mux
 }
 
-// instrumentedWriter decorates a Writer with Prometheus counters. Kept in
-// main.go (not internal/metrics) because it is composition of the two -
-// neither package owns both.
+// instrumentedWriter decorates a Writer with Prometheus counters and the
+// checkpoint progress hook. Kept in main.go because it is composition of
+// three packages - none of them owns the others.
 type instrumentedWriter struct {
 	inner consumer.Writer
 	m     *metrics.Metrics
+	cp    *checkpoint.Checkpointer
 }
 
-func newInstrumentedWriter(inner consumer.Writer, m *metrics.Metrics) *instrumentedWriter {
-	return &instrumentedWriter{inner: inner, m: m}
+func newInstrumentedWriter(inner consumer.Writer, m *metrics.Metrics, cp *checkpoint.Checkpointer) *instrumentedWriter {
+	return &instrumentedWriter{inner: inner, m: m, cp: cp}
 }
 
 func (i *instrumentedWriter) ApplyBatch(ctx context.Context, evs []writer.CDCEvent) error {
@@ -141,22 +229,62 @@ func (i *instrumentedWriter) ApplyBatch(ctx context.Context, evs []writer.CDCEve
 		i.m.WriteErrors.WithLabelValues("mongo", classify(err)).Inc()
 		return err
 	}
+	now := time.Now()
+	var maxLSN int64
 	for _, ev := range evs {
 		i.m.EventsProcessed.WithLabelValues("sink", ev.Table, string(ev.Op)).Inc()
+		if ev.LSN > maxLSN {
+			maxLSN = ev.LSN
+		}
+		// SourceTsMs == 0 is "unknown" (snapshot reads, malformed
+		// Debezium envelopes). Skip rather than emit lag = epoch.
+		if ev.SourceTsMs > 0 {
+			lag := now.Sub(time.UnixMilli(ev.SourceTsMs)).Seconds()
+			if lag < 0 {
+				// Source clock ahead of sink clock; clamp so the
+				// histogram does not grow a useless negative bucket.
+				lag = 0
+			}
+			i.m.ReplicationLag.WithLabelValues(ev.Table).Observe(lag)
+		}
+	}
+	if i.cp != nil {
+		i.cp.MarkProgress(maxLSN, len(evs))
 	}
 	return nil
 }
 
+// classify maps a Mongo write error onto a small, bounded set of reason labels
+// for migration_write_errors_total. We prefer typed inspection over substring
+// matching: connection-level failures wear net.Error / mongo.CommandError, and
+// context.Canceled / DeadlineExceeded carry their own sentinels. Unknown
+// errors collapse to "other" so cardinality stays bounded even if Mongo grows
+// new error shapes.
 func classify(err error) string {
-	msg := err.Error()
 	switch {
-	case strings.Contains(msg, "context"):
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return "context"
-	case strings.Contains(msg, "connection"):
-		return "connection"
-	default:
-		return "other"
 	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "timeout"
+		}
+		return "connection"
+	}
+	var serverErr mongo.ServerError
+	if errors.As(err, &serverErr) {
+		switch {
+		case serverErr.HasErrorCode(11000):
+			return "duplicate_key"
+		case serverErr.HasErrorLabel("NetworkError"):
+			return "connection"
+		case serverErr.HasErrorLabel("RetryableWriteError"):
+			return "retryable"
+		}
+		return "server"
+	}
+	return "other"
 }
 
 // --- env helpers ---

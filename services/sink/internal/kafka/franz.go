@@ -45,6 +45,14 @@ func (f *FranzConsumer) Close() {
 	f.client.Close()
 }
 
+// Client exposes the underlying kgo client so admin-style queries (lag
+// probing, end-offset listing) can share its connection pool. Returned
+// pointer must NOT be Close()d by the caller - lifetime belongs to
+// FranzConsumer.
+func (f *FranzConsumer) Client() *kgo.Client {
+	return f.client
+}
+
 // Poll drains one batch of records from the broker. A non-empty
 // fetch error short-circuits — Kafka redelivers from the last
 // committed offset on the next poll.
@@ -58,12 +66,20 @@ func (f *FranzConsumer) Poll(ctx context.Context) ([]consumer.Record, error) {
 	}
 	var out []consumer.Record
 	fetches.EachRecord(func(r *kgo.Record) {
+		var hdrs []consumer.HeaderKV
+		if len(r.Headers) > 0 {
+			hdrs = make([]consumer.HeaderKV, 0, len(r.Headers))
+			for _, h := range r.Headers {
+				hdrs = append(hdrs, consumer.HeaderKV{Key: h.Key, Value: h.Value})
+			}
+		}
 		out = append(out, consumer.Record{
 			Key:       r.Key,
 			Value:     r.Value,
 			Offset:    r.Offset,
 			Partition: r.Partition,
 			Topic:     r.Topic,
+			Headers:   hdrs,
 			Raw:       r,
 		})
 	})

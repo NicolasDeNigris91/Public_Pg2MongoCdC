@@ -31,7 +31,7 @@ demo: ## Boot the core stack and register connectors
 	@echo "  make status           # connector health"
 
 .PHONY: demo-full
-demo-full: ## Boot core stack + chaos overlay (Prometheus, Grafana, Toxiproxy, exporters)
+demo-full: ## Boot core stack + chaos overlay (Prometheus, Grafana, Toxiproxy, exporters, Jaeger)
 	@[ -f .env ] || cp .env.example .env
 	$(COMPOSE) -f docker-compose.yml -f docker-compose.chaos.yml up -d --build --wait
 	bash scripts/register-connectors.sh
@@ -39,6 +39,7 @@ demo-full: ## Boot core stack + chaos overlay (Prometheus, Grafana, Toxiproxy, e
 	@echo "Full stack is up. Open:"
 	@echo "  http://localhost:3000   (Grafana, user=anonymous)"
 	@echo "  http://localhost:9090   (Prometheus)"
+	@echo "  http://localhost:16686  (Jaeger - end-to-end traces)"
 	@echo "  http://localhost:8474   (Toxiproxy admin)"
 
 .PHONY: down
@@ -90,7 +91,18 @@ show-topics: ## List Kafka topics and recent CDC events
 # --------------------------------------------------------------------
 .PHONY: load
 load: ## Run k6 load test against Postgres (requires docker-compose.chaos.yml up)
-	$(COMPOSE) -f docker-compose.yml -f docker-compose.chaos.yml run --rm k6 run /scripts/write-mix.js
+	# MSYS_NO_PATHCONV stops Git Bash on Windows from rewriting /scripts/...
+	# into C:/Program Files/Git/scripts/... before the docker invocation.
+	MSYS_NO_PATHCONV=1 $(COMPOSE) -f docker-compose.yml -f docker-compose.chaos.yml run --rm k6 run /scripts/write-mix.js
+
+.PHONY: load-slo
+load-slo: ## Run k6 then assert CDC-side SLOs (lag p99, error rate) against Prometheus. Fails build on breach.
+	MSYS_NO_PATHCONV=1 $(COMPOSE) -f docker-compose.yml -f docker-compose.chaos.yml run --rm k6 run /scripts/write-mix.js
+	bash scripts/check-load-slos.sh
+
+.PHONY: check-load-slos
+check-load-slos: ## Run only the post-load SLO assertions against the live Prometheus
+	bash scripts/check-load-slos.sh
 
 .PHONY: chaos
 chaos: ## Run all chaos scenarios, fail on any failure
@@ -100,6 +112,10 @@ chaos: ## Run all chaos scenarios, fail on any failure
 verify: ## Compare PG vs Mongo row counts and content hashes
 	bash chaos/verify-integrity.sh
 
+.PHONY: check-alerts
+check-alerts: ## Verify every alert rule has a producing metric in code (drift detector)
+	bash scripts/check-alert-metrics.sh
+
 .PHONY: reprocess-dlq
-reprocess-dlq: ## Replay DLQ topics after triage
-	@echo "NOT YET IMPLEMENTED" && exit 1
+reprocess-dlq: ## Triage DLQ topics (dry-run). Pass ARGS="--replay" to actually re-publish.
+	bash scripts/reprocess-dlq.sh $(ARGS)

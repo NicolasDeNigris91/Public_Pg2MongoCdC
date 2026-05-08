@@ -17,13 +17,17 @@ const (
 )
 
 // CDCEvent is the minimal cross-source projection of a Debezium event.
+// SourceTsMs is the Postgres commit time (`source.ts_ms`) in unix-millis;
+// 0 means unknown and downstream consumers MUST treat it as a sentinel
+// (e.g. skip emitting replication-lag samples) rather than as t=epoch.
 type CDCEvent struct {
-	Table  string
-	PK     string
-	LSN    int64
-	Op     CDCOp
-	After  map[string]any
-	Before map[string]any
+	Table      string
+	PK         string
+	LSN        int64
+	SourceTsMs int64
+	Op         CDCOp
+	After      map[string]any
+	Before     map[string]any
 }
 
 // WriteOpKind enumerates the Mongo operations BuildWriteOp can emit.
