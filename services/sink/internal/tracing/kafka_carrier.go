@@ -21,6 +21,7 @@ func NewKafkaHeaderCarrier(h *[]kgo.RecordHeader) KafkaHeaderCarrier {
 	return KafkaHeaderCarrier{headers: h}
 }
 
+// Get returns the first value for key, or "" if absent.
 func (c KafkaHeaderCarrier) Get(key string) string {
 	if c.headers == nil {
 		return ""
@@ -33,6 +34,7 @@ func (c KafkaHeaderCarrier) Get(key string) string {
 	return ""
 }
 
+// Set replaces the header value for key, or appends if not present.
 func (c KafkaHeaderCarrier) Set(key, value string) {
 	if c.headers == nil {
 		return
@@ -49,6 +51,7 @@ func (c KafkaHeaderCarrier) Set(key, value string) {
 	*c.headers = append(*c.headers, kgo.RecordHeader{Key: key, Value: []byte(value)})
 }
 
+// Keys returns the header keys in the order they appear.
 func (c KafkaHeaderCarrier) Keys() []string {
 	if c.headers == nil {
 		return nil

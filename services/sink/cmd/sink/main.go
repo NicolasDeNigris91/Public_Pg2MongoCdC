@@ -59,7 +59,7 @@ func main() {
 	// running with zero overhead beyond the propagator install).
 	tracingShutdown, err := tracing.Init(rootCtx, "sink", "dev")
 	if err != nil {
-		log.Fatalf("tracing init: %v", err)
+		log.Fatalf("tracing init: %v", err) //nolint:gocritic // boot-time fatal; no useful cleanup at this point
 	}
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

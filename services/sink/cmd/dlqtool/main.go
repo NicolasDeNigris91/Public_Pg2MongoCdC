@@ -73,7 +73,7 @@ func main() {
 	endOffsets, exists, err := topicEndOffsets(ctx, brokerList, *topic)
 	if err != nil {
 		log.Printf("dlqtool: list offsets for %s: %v", *topic, err)
-		os.Exit(1)
+		os.Exit(1) //nolint:gocritic // boot-time fatal; no useful cleanup at this point
 	}
 	if !exists {
 		log.Printf("dlqtool: topic %q does not exist (no DLQ activity yet?)", *topic)

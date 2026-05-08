@@ -40,9 +40,9 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// Tracer name — every span emitted through Tracer() carries this as its
-// instrumentation library name. Keep stable across releases so
-// dashboards do not lose their grouping.
+// TracerName is the instrumentation library name carried by every span
+// emitted through Tracer(). Keep stable across releases so dashboards
+// do not lose their grouping.
 const TracerName = "pg2mongo-cdc"
 
 // Init bootstraps the global OTel tracer + propagator and returns a

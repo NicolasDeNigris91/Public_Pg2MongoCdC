@@ -51,7 +51,7 @@ type WriteOp struct {
 // BuildWriteOp builds the Mongo op for one CDC event. The LSN gate on the
 // filter is what makes at-least-once delivery safe: a redelivered or stale
 // event carries an LSN <= the stored one and is rejected as a no-op.
-func BuildWriteOp(ev CDCEvent, schemaVersion int) (WriteOp, error) {
+func BuildWriteOp(ev CDCEvent, schemaVersion int) (WriteOp, error) { //nolint:gocritic // CDCEvent passed by value is the contract: events are immutable, no aliasing
 	id := ev.Table + ":" + ev.PK
 
 	if ev.Op != OpDelete && ev.After == nil {

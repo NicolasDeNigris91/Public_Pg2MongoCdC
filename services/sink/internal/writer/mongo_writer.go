@@ -34,7 +34,7 @@ func NewMongoWriter(client *mongo.Client, db string, schemaVersion int, onSkip f
 }
 
 // Apply is a single-event convenience wrapper around ApplyBatch.
-func (m *MongoWriter) Apply(ctx context.Context, ev CDCEvent) error {
+func (m *MongoWriter) Apply(ctx context.Context, ev CDCEvent) error { //nolint:gocritic // CDCEvent passed by value is the contract: events are immutable, no aliasing
 	return m.ApplyBatch(ctx, []CDCEvent{ev})
 }
 

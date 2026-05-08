@@ -148,7 +148,7 @@ func (p *Probe) Probe(ctx context.Context) error {
 
 	var total int64
 	for _, partsByTopic := range gl.Lag {
-		for _, l := range partsByTopic {
+		for _, l := range partsByTopic { //nolint:gocritic // kadm map values can't be address-taken; copy at probe interval is negligible
 			if l.Lag > 0 {
 				total += l.Lag
 			}
