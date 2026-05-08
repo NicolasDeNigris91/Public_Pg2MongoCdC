@@ -5,8 +5,10 @@ package writer
 
 import "fmt"
 
+// CDCOp is the Debezium-style change kind carried on every CDCEvent.
 type CDCOp string
 
+// CDCOp values map 1-to-1 with Debezium "op" payload codes.
 const (
 	OpInsert CDCOp = "c"
 	OpUpdate CDCOp = "u"
@@ -24,13 +26,17 @@ type CDCEvent struct {
 	Before map[string]any
 }
 
+// WriteOpKind enumerates the Mongo operations BuildWriteOp can emit.
 type WriteOpKind int
 
+// WriteOpKind values.
 const (
 	WriteOpDelete WriteOpKind = iota
 	WriteOpUpsert
 )
 
+// WriteOp is the storage-agnostic write description produced by
+// BuildWriteOp. The mongo adapter translates it into a WriteModel.
 type WriteOp struct {
 	Kind   WriteOpKind
 	Filter map[string]any

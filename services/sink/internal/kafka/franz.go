@@ -11,10 +11,15 @@ import (
 	"github.com/twmb/franz-go/pkg/kgo"
 )
 
+// FranzConsumer is the franz-go-backed implementation of
+// consumer.KafkaConsumer.
 type FranzConsumer struct {
 	client *kgo.Client
 }
 
+// New connects to the supplied brokers as a member of groupID and
+// subscribes by regex. Auto-commit is disabled — the loop commits
+// only after the downstream write succeeds.
 func New(brokers []string, groupID, topicRegex string) (*FranzConsumer, error) {
 	client, err := kgo.NewClient(
 		kgo.SeedBrokers(brokers...),
@@ -35,10 +40,14 @@ func New(brokers []string, groupID, topicRegex string) (*FranzConsumer, error) {
 	return &FranzConsumer{client: client}, nil
 }
 
+// Close releases the underlying client connection.
 func (f *FranzConsumer) Close() {
 	f.client.Close()
 }
 
+// Poll drains one batch of records from the broker. A non-empty
+// fetch error short-circuits — Kafka redelivers from the last
+// committed offset on the next poll.
 func (f *FranzConsumer) Poll(ctx context.Context) ([]consumer.Record, error) {
 	fetches := f.client.PollFetches(ctx)
 	if ctx.Err() != nil {
@@ -71,6 +80,8 @@ func (f *FranzConsumer) MarkCommit(r consumer.Record) {
 	}
 }
 
+// CommitMarked flushes the marked offsets to the group. Called once
+// per RunOnce after the batch apply succeeds.
 func (f *FranzConsumer) CommitMarked(ctx context.Context) error {
 	return f.client.CommitMarkedOffsets(ctx)
 }
