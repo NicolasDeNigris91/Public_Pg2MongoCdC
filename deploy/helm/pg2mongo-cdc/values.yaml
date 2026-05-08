@@ -213,3 +213,24 @@ podMonitor:
   scrapeTimeout: 10s
   # Drop the noisiest go_* internals if your Prometheus is constrained.
   metricRelabelings: []
+
+# -----------------------------------------------------------------------------
+# Prometheus alert rules. Requires prometheus-operator. Mirrors
+# observability/prometheus/alerts.yml from the source repo (kept in sync
+# by review; CI's check-alert-metrics.sh enforces metric existence
+# regardless of which copy a deployment uses).
+# -----------------------------------------------------------------------------
+prometheusRule:
+  enabled: true
+  interval: 30s
+  # Extra labels (e.g. for Alertmanager routing) merged into the rule's labels.
+  additionalLabels: {}
+  thresholds:
+    # p99 replication lag in seconds before ReplicationLagHigh fires.
+    replicationLagP99Seconds: 10
+    # Records of consumer-group lag before ConsumerLagHigh fires.
+    consumerLagRecords: 10000
+    # Fractional write error rate before WriteErrorRateHigh fires (0.001 = 0.1%).
+    writeErrorRate: 0.001
+    # Consecutive ApplyBatch failures (in backoff) before SinkApplyStuck fires.
+    consecutiveApplyFailures: 5

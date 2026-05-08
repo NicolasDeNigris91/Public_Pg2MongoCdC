@@ -13,12 +13,25 @@ groups:
           runbook: "docs/runbook.md#replicationlaghigh"
 
       - alert: ConsumerLagHigh
-        expr: sum(kafka_consumergroup_lag) by (consumergroup) > 10000
+        # Prefer the sink-emitted gauge (always present in any deployment)
+        # and fall back to kafka-exporter's gauge (only present when the
+        # chaos overlay is up). `or` here returns the first vector with
+        # samples, so this stays correct in either topology.
+        expr: (migration_consumer_group_lag or sum(kafka_consumergroup_lag) by (consumergroup)) > 10000
         for: 2m
         labels: { severity: warning }
         annotations:
           summary: "Consumer group lag > 10k for 2m"
           runbook: "docs/runbook.md#consumerlaghigh"
+
+      - alert: ConsumerLagProbeStale
+        expr: migration_consumer_group_lag_age_seconds > 300
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Sink-side lag probe stale for >5m"
+          description: "Sink cannot describe its own consumer group via Kafka admin. Investigate broker auth/connectivity from the sink pod."
+          runbook: "docs/runbook.md#consumerlagprobestale"
 
       - alert: DLQNonEmpty
         expr: sum(kafka_topic_partition_current_offset{topic=~"dlq\\..*"} - kafka_topic_partition_oldest_offset{topic=~"dlq\\..*"}) > 0
@@ -44,6 +57,15 @@ groups:
         annotations:
           summary: "Sink write error rate > 0.1% for 5m"
           runbook: "docs/runbook.md#writeerrorratehigh"
+
+      - alert: SinkApplyStuck
+        expr: max(migration_consecutive_apply_failures) > 5
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Sink has failed >5 consecutive ApplyBatch calls"
+          description: "Sink is in exponential backoff; downstream (Mongo) is unreachable or rejecting writes. ConsumerLagHigh will follow if this persists."
+          runbook: "docs/runbook.md#sinkapplystuck"
 
       - alert: ReplicationSlotInactive
         expr: pg_replication_slots_active == 0
