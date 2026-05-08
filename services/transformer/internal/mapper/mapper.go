@@ -13,17 +13,21 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// FieldRule maps one source field to a target name; Type is a hint for
+// future typed conversions (currently unused at runtime).
 type FieldRule struct {
 	Type   string `yaml:"type"`
 	Target string `yaml:"target"`
 }
 
+// Rule is the parsed YAML transform definition for one source table.
 type Rule struct {
 	Source string               `yaml:"source"`
 	Target string               `yaml:"target"`
 	Fields map[string]FieldRule `yaml:"fields"`
 }
 
+// Mapper holds the rule set keyed by source table name.
 type Mapper struct {
 	byTable map[string]*Rule
 }
@@ -89,6 +93,8 @@ func (m *Mapper) ApplyJSON(topic string, envelope []byte) ([]byte, error) {
 	return json.Marshal(env)
 }
 
+// Rules returns the loaded rule set keyed by source table. The
+// returned map is the live store; callers must not mutate it.
 func (m *Mapper) Rules() map[string]*Rule { return m.byTable }
 
 // tableFromSource: "public.users" -> "users".

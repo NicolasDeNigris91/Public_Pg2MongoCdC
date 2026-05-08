@@ -17,10 +17,13 @@ type MongoWriter struct {
 	schemaVersion int
 }
 
+// NewMongoWriter binds a Mongo client to a database name and the
+// pipeline's schema version (used by BuildWriteOp to gate replays).
 func NewMongoWriter(client *mongo.Client, db string, schemaVersion int) *MongoWriter {
 	return &MongoWriter{client: client, db: db, schemaVersion: schemaVersion}
 }
 
+// Apply is a single-event convenience wrapper around ApplyBatch.
 func (m *MongoWriter) Apply(ctx context.Context, ev CDCEvent) error {
 	return m.ApplyBatch(ctx, []CDCEvent{ev})
 }
